@@ -7,7 +7,6 @@ from tmrl.custom.utils.control_mouse import mouse_close_finish_pop_up_tm20, mous
 from tmrl.custom.utils.tools import TM2020OpenPlanetClient
 from tmrl.util import partial
 from tmrl.actor import ActorModule
-from tmrl.custom.custom_models import mlp
 from tmrl.wrappers import AffineObservationWrapper
 import tmrl.config.config_constants as cfg
 
@@ -38,6 +37,50 @@ from torch.distributions.normal import Normal
 import torch.nn.functional as F
 
 import numpy as np
+
+def dict_to_list(l):
+    ll = []
+    for i in l:
+        if type(i) == dict:
+            ll += dict_to_list(list(i.values()))
+        elif type(i) == Vector3:
+            ll += dict_to_list(list(i.__dict__.values()))
+        elif type(i) == list:
+            ll += dict_to_list(i)
+        else:
+            ll.append(i)
+    return ll
+
+def collate(batch, device=None):
+    """Turns a batch of nested structures with numpy arrays as leaves into into a single element of the same nested structure with batched torch tensors as leaves"""
+    elem = batch[0]
+    if isinstance(elem, torch.Tensor):
+        # return torch.stack(batch, 0).to(device, non_blocking=non_blocking)
+        if elem.numel() < 20000:  # TODO: link to the relevant profiling that lead to this threshold
+            return torch.stack(batch).to(device)
+        else:
+            return torch.stack([b.contiguous().to(device) for b in batch], 0)
+    elif isinstance(elem, np.ndarray):
+        for b in batch:
+            if type(b[0]) != dict:
+                return collate(tuple(torch.from_numpy(b)))
+            else:
+                l = dict_to_list(b)
+                l = np.array(l, np.float32)
+                l[l >= 1E308] = 1E30
+                return collate(tuple(torch.from_numpy(l)))
+        # return collate(tuple(torch.from_numpy(b) if type(b[0]) != dict else torch.from_numpy(np.array(i.values() for i in b)) for b in batch), device)
+    elif hasattr(elem, '__torch_tensor__'):
+        return torch.stack([b.__torch_tensor__().to(device) for b in batch], 0)
+    elif isinstance(elem, Sequence):
+        transposed = zip(*batch)
+        return type(elem)(collate(samples, device) for samples in transposed)
+    elif isinstance(elem, Mapping):
+        return type(elem)((key, collate(tuple(d[key] for d in batch), device)) for key in elem)
+    else:
+        l = np.array(batch, np.float32)
+        l[l >= 1E308] = 1E30
+        return torch.from_numpy(l).to(device)  # we create a numpy array first to work around https://github.com/pytorch/pytorch/issues/24200
 
 def deepmap(f, m):
     """Apply functions to the leaves of a dictionary or list, depending type of the leaf value.
@@ -89,11 +132,31 @@ def prod(iterable: tuple[int]) -> int:
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
 
+def mlp(sizes, activation, output_activation=nn.Identity):
+    layers = []
+    for j in range(len(sizes) - 1):
+        act = activation if j < len(sizes) - 2 else output_activation
+        layers += [nn.Linear(sizes[j], sizes[j + 1]), act()]
+    return nn.Sequential(*layers)
+class MLPQFunction(nn.Module):
+    def __init__(self, obs_space, act_space, hidden_sizes=(256, 256), activation=nn.ReLU):
+        super().__init__()
+        obs_dim = sum(prod(s for s in space.shape) for space in obs_space)
+        # obs_dim = 315
+        act_dim = act_space.shape[0]
+        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
+
+    def forward(self, obs, act):
+        x = torch.cat((*obs, act), -1)
+        q = self.q(x)
+        return torch.squeeze(q, -1)  # Critical to ensure q has right shape.
+
 class SquashedGaussianMLPActor(ActorModule):
     def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU, act_buf_len=0):
         super().__init__(observation_space, action_space)
         dim_obs = sum(prod(s for s in space.shape) for space in observation_space)
-        dim_obs = 315
+        print(dim_obs)
+        # dim_obs = 499
         dim_act = action_space.shape[0]
         act_limit = action_space.high[0]
         self.net = mlp([dim_obs] + list(hidden_sizes), activation, activation)
@@ -105,6 +168,7 @@ class SquashedGaussianMLPActor(ActorModule):
         data = torch.cat(obs, -1)
         np.ma.masked_array(data, ~np.isfinite(data)).filled(0)
         net_out = self.net(data)
+
         mu = self.mu_layer(net_out)
         log_std = self.log_std_layer(net_out)
         log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
@@ -186,6 +250,61 @@ NB_OBS_FORWARD = 500  # this allows (and rewards) 50m cuts
 
 # Interface for Trackmania 2020 ========================================================================================
 
+class Buffer:
+    """
+    Buffer of training samples.
+
+    `Server`, `RolloutWorker` and `Trainer` all have their own `Buffer` to store and send training samples.
+
+    Samples are tuples of the form (`act`, `new_obs`, `rew`, `done`, `info`)
+    """
+    def __init__(self, maxlen=cfg.BUFFERS_MAXLEN):
+        """
+        Args:
+            maxlen (int): buffer length
+        """
+        self.memory = []
+        self.stat_train_return = 0.0  # stores the train return
+        self.stat_test_return = 0.0  # stores the test return
+        self.stat_train_steps = 0  # stores the number of steps per training episode
+        self.stat_test_steps = 0  # stores the number of steps per test episode
+        self.maxlen = maxlen
+
+    def clip_to_maxlen(self):
+        lenmem = len(self.memory)
+        if lenmem > self.maxlen:
+            print_with_timestamp("buffer overflow. Discarding old samples.")
+            self.memory = self.memory[(lenmem - self.maxlen):]
+
+    def append_sample(self, sample):
+        """
+        Appends `sample` to the buffer.
+
+        Args:
+            sample (Tuple): a training sample of the form (`act`, `new_obs`, `rew`, `done`, `info`)
+        """
+        self.memory.append(sample)
+        self.clip_to_maxlen()
+
+    def clear(self):
+        """
+        Clears the buffer but keeps train and test returns.
+        """
+        self.memory = []
+
+    def __len__(self):
+        return len(self.memory)
+
+    def __iadd__(self, other):
+        for i in other.memory:
+            self.memory.append(i)
+        self.clip_to_maxlen()
+        self.stat_train_return = other.stat_train_return
+        self.stat_test_return = other.stat_test_return
+        self.stat_train_steps = other.stat_train_steps
+        self.stat_test_steps = other.stat_test_steps
+        return self
+
 class TM2020InterfaceCustom(RealTimeGymInterface):
     """
     This is the API needed for the algorithm to control Trackmania2020
@@ -209,6 +328,7 @@ class TM2020InterfaceCustom(RealTimeGymInterface):
         self.initialized = False
         self.record = record
         self.track = None
+        self.max_track_element = 100
 
     def initialize_common(self):
         if self.gamepad:
@@ -327,7 +447,7 @@ class TM2020InterfaceCustom(RealTimeGymInterface):
             self.pos_hist.append(pos)
         poss = np.array(list(self.pos_hist), dtype='float32')
 
-        block:list[dict] = []
+        block = deque(maxlen=self.max_track_element)
         for i in track:
             block.append({
                 "name": int(i.name, base=36) if i.name != "" else 0,
@@ -337,9 +457,17 @@ class TM2020InterfaceCustom(RealTimeGymInterface):
                 "flags": i.flags,
                 "skin": i.skin,
             })
-
-        block = np.array(block)
-        obs = [speed, poss, block]
+        
+        for i in range(self.max_track_element-len(block)):
+            block.append({
+                "name": 0,
+                "rotation": 0,
+                "position": {"x":0, "y":0, "z":0},
+                "speed": 0,
+                "flags": 0,
+                "skin": 0,
+            })
+        obs = [speed, poss, np.array(block)]
         self.reward_function.reset()
         return obs  # if not self.record else data
 
@@ -360,7 +488,7 @@ class TM2020InterfaceCustom(RealTimeGymInterface):
             data[0],
         ], dtype='float32')
         poss = np.array(list(self.pos_hist), dtype='float32')
-        block:list[dict] = []
+        block = deque(maxlen=self.max_track_element)
         for i in track:
             block.append({
                 "name": int(i.name, base=36) if i.name != "" else 0,
@@ -370,9 +498,17 @@ class TM2020InterfaceCustom(RealTimeGymInterface):
                 "flags": i.flags,
                 "skin": i.skin,
             })
-
-        block = np.array(block)
-        obs = [speed, poss, block]
+        
+        for i in range(self.max_track_element-len(block)):
+            block.append({
+                "name": 0,
+                "rotation": 0,
+                "position": {"x":0, "y":0, "z":0},
+                "speed": 0,
+                "flags": 0,
+                "skin": 0,
+            })
+        obs = [speed, poss, np.array(block)]
         end_of_track = bool(data[8])
         info = {}
         if end_of_track:
@@ -401,11 +537,10 @@ class TM2020InterfaceCustom(RealTimeGymInterface):
             "flags": spaces.Box(0, 8000000000, (1, ), np.uint64),
             "skin": spaces.Box(0, 8000000000, (1, ), np.uint64),
         }
-        max_track_element = 50
         
-        return spaces.Tuple((speed, poss, spaces.Space((max_track_element, spaces.Dict(track)))))
+        return spaces.Tuple((speed, poss, spaces.Space((self.max_track_element, spaces.Dict(track)))))
 
-INT = partial(TM2020InterfaceCustom, "C:\\Users\\Corentin\\Documents\\Trackmania2020\\Maps\\My Maps\\Sans nom.Map.Gbx", pos_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
+INT = partial(TM2020InterfaceCustom, "C:\\Users\\Corentin\\Documents\\Trackmania2020\\Maps\\My Maps\\tmrl-train.Map.Gbx", pos_hist_len=cfg.IMG_HIST_LEN, gamepad=cfg.PRAGMA_GAMEPAD)
 
 CONFIG_DICT = rtgym.DEFAULT_CONFIG_DICT.copy()
 CONFIG_DICT["interface"] = INT

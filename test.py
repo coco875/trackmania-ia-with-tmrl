@@ -1,11 +1,47 @@
 from pygbx import Gbx, GbxType
 import tmrl.config.config_constants as cfg
+import tmrl.config.config_objects as cfg_obj
+import gym.spaces as spaces
+import functools
+import numpy as np
 
-print(cfg.DATASET_PATH)
-print(cfg.CHECKPOINT_PATH)
-print(cfg.MODEL_PATH_WORKER)
-print(cfg.PRAGMA_LIDAR)
-print(cfg.PRAGMA_RNN)
+def mul(a,b) -> int:
+    if type(a) == spaces.Dict:
+        n = 0
+        for i in a:
+            n += prod(a[i].shape)
+        a = n
+    
+    if type(b) == spaces.Dict:
+        n = 0
+        for i in b:
+            n += prod(b[i].shape)
+        print(b)
+        b = n
+    
+    return a*b
+
+def prod(iterable: tuple[int]) -> int:
+    return functools.reduce(mul, iterable, 1) # need to be fix with a dict
+
+speed = spaces.Box(low=0.0, high=1000.0, shape=(1, ))
+poss = spaces.Box(low=0.0, high=999999999, shape=(
+    4,
+    3,
+))  # historic of position
+track = {
+    "name": spaces.Box(0, 99999999, (1, ), np.uint64),
+    "rotation": spaces.Box(0, 6, (1, ), np.int32),
+    "position": spaces.Box(-99999999, 99999999, (3, ), np.int64),
+    "speed": spaces.Box(-99999999, 99999999, (1, ), np.int64),
+    "flags": spaces.Box(0, 8000000000, (1, ), np.uint64),
+    "skin": spaces.Box(0, 8000000000, (1, ), np.uint64),
+}
+
+obs_space = spaces.Tuple((speed, poss, spaces.Space((100, spaces.Dict(track)))))
+
+print(sum(prod(s for s in space.shape) for space in obs_space)
+    )
 
 exit()
 

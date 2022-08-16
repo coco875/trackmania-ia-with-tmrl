@@ -3,10 +3,10 @@ from argparse import ArgumentParser
 
 import tmrl.config.config_constants as cfg
 import tmrl.config.config_objects as cfg_obj
-from tmrl.networking import Buffer, print_with_timestamp, get_connected_socket, poll_and_recv_or_close_socket
+from tmrl.networking import print_with_timestamp, get_connected_socket, poll_and_recv_or_close_socket
 from threading import Lock, Thread
 from pygbx.headers import Vector3
-from common import ENV_CLS, GenericGymEnv, POLICY
+from common import ENV_CLS, GenericGymEnv, POLICY, collate, Buffer
 
 import torch
 import datetime
@@ -52,7 +52,6 @@ def send_object(sock, obj, ping=False, pong=False, ack=False):
         msg = bytes(f"{len(msg):<{cfg.HEADER_SIZE}}", 'utf-8') + msg
         if cfg.PRINT_BYTESIZES:
             print_with_timestamp(f"Sending {len(msg)} bytes.")
-    print(len(msg))
     try:
         sock.sendall(msg)
     except OSError:  # connection closed or broken
@@ -80,50 +79,6 @@ def select_and_send_or_close_socket(obj, conn):
         conn.close()
         return False
     return True
-
-def dict_to_list(l):
-    ll = []
-    for i in l:
-        if type(i) == dict:
-            ll += dict_to_list(list(i.values()))
-        elif type(i) == Vector3:
-            ll += dict_to_list(list(i.__dict__.values()))
-        elif type(i) == list:
-            ll += dict_to_list(i)
-        else:
-            ll.append(i)
-    return ll
-
-def collate(batch, device=None):
-    """Turns a batch of nested structures with numpy arrays as leaves into into a single element of the same nested structure with batched torch tensors as leaves"""
-    elem = batch[0]
-    if isinstance(elem, torch.Tensor):
-        # return torch.stack(batch, 0).to(device, non_blocking=non_blocking)
-        if elem.numel() < 20000:  # TODO: link to the relevant profiling that lead to this threshold
-            return torch.stack(batch).to(device)
-        else:
-            return torch.stack([b.contiguous().to(device) for b in batch], 0)
-    elif isinstance(elem, np.ndarray):
-        for b in batch:
-            if type(b[0]) != dict:
-                return collate(tuple(torch.from_numpy(b)))
-            else:
-                l = dict_to_list(b)
-                l = np.array(l, np.float32)
-                l[l >= 1E308] = 0
-                return collate(tuple(torch.from_numpy(l)))
-        # return collate(tuple(torch.from_numpy(b) if type(b[0]) != dict else torch.from_numpy(np.array(i.values() for i in b)) for b in batch), device)
-    elif hasattr(elem, '__torch_tensor__'):
-        return torch.stack([b.__torch_tensor__().to(device) for b in batch], 0)
-    elif isinstance(elem, Sequence):
-        transposed = zip(*batch)
-        return type(elem)(collate(samples, device) for samples in transposed)
-    elif isinstance(elem, Mapping):
-        return type(elem)((key, collate(tuple(d[key] for d in batch), device)) for key in elem)
-    else:
-        l = np.array(batch, np.float32)
-        l[l >= 1E308] = 0
-        return torch.from_numpy(l).to(device)  # we create a numpy array first to work around https://github.com/pytorch/pytorch/issues/24200
 
 TMRL_FOLDER = pathlib.Path("D:/GitHub/trackmania-ia-with-tmrl") / "TmrlData"
 
@@ -309,6 +264,7 @@ class RolloutWorker:
                 sample = self.get_local_buffer_sample(act, new_obs, rew, done, info)
             else:
                 sample = act, new_obs, rew, done, info
+            print(len(sample[1][0]), len(sample[1][1]), len(sample[1][2]))
             self.buffer.append_sample(sample)
         return new_obs
 
@@ -348,6 +304,7 @@ class RolloutWorker:
                 sample = self.get_local_buffer_sample(act, new_obs, rew, stored_done, info)
             else:
                 sample = act, new_obs, rew, stored_done, info
+            # print(len(self.buffer.memory[0][1][0]), len(self.buffer.memory[0][1][1]), len(self.buffer.memory[0][1][2]))
             self.buffer.append_sample(sample)  # CAUTION: in the buffer, act is for the PREVIOUS transition (act, obs(act))
         return new_obs, rew, done, info
 
@@ -503,7 +460,7 @@ class RolloutWorker:
 
 rw = RolloutWorker(env_cls=ENV_CLS,
                     actor_module_cls=POLICY,
-                    sample_compressor=cfg_obj.SAMPLE_COMPRESSOR,
+                    sample_compressor=None,
                     device='cuda' if cfg.PRAGMA_CUDA_INFERENCE else 'cpu',
                     server_ip=cfg.SERVER_IP_FOR_WORKER,
                     min_samples_per_worker_packet=1000 if not cfg.CRC_DEBUG else cfg.CRC_DEBUG_SAMPLES,
